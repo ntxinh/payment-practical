@@ -29,6 +29,11 @@ export type Finix = {
   applicationId: string;
 };
 
+/** How long a failed-and-never-stamped charge is treated as possibly-live
+ *  provider-side (throw-after-commit). Longer than any realistic webhook lag;
+ *  inside it, cross-plan retries are refused rather than risk double-billing. */
+const RECONCILE_DEADLINE_MS = 24 * 60 * 60 * 1000;
+
 // process.env (not env.ts) so tests can inject creds after module load.
 let client: Finix | null | undefined;
 
@@ -202,12 +207,13 @@ export async function createFinixSubscription(
   plan: Plan,
   paymentInstrumentId: string,
 ): Promise<{ subscription: Subscription; charge: Charge }> {
-  // Retry guard. Live subs (active/past_due, or incomplete with an in-flight
-  // charge) block — regardless of newer rows in any provider. A DEAD residue —
+  // Retry guard. Live subs (active/past_due) and ANY sub with a pending
+  // charge block — regardless of newer rows in any provider. A DEAD residue —
   // sub dead because its charge failed before a transfer id was ever recorded
   // (the postTransfer-throw path) — is retried IN PLACE: the transfer may still
   // exist provider-side, and only reusing its charge id as idempotency key
-  // keeps a retry from double-billing. Cross-plan residue is blocked outright.
+  // keeps a retry from double-billing. Cross-plan residue blocks for
+  // RECONCILE_DEADLINE_MS, then the user can start fresh.
   const candidates = db
     .select()
     .from(subscriptions)
@@ -231,11 +237,19 @@ export async function createFinixSubscription(
       .orderBy(desc(charges.createdAt), desc(charges.id))
       .limit(1)
       .get();
-    if (sub.status === "incomplete" && last?.status === "pending") {
+    // A pending charge is live money no matter what status the sub carries —
+    // a webhook re-arm can leave pending under incomplete_expired.
+    if (last?.status === "pending") {
       throw new BillingError("FINIX_SUB_EXISTS");
     }
     if (last?.status === "failed" && last.finixTransferId === null) {
-      if (sub.planId !== plan.id) throw new BillingError("FINIX_SUB_EXISTS");
+      const stillReconcilable = Date.now() - last.updatedAt < RECONCILE_DEADLINE_MS;
+      if (sub.planId !== plan.id) {
+        // Cross-plan residue blocks until the reconcile window expires; a
+        // transfer that was going to turn up would have by then.
+        if (stillReconcilable) throw new BillingError("FINIX_SUB_EXISTS");
+        continue; // stale residue, different plan — safe to start fresh
+      }
       residue = { sub, charge: last };
     }
   }
@@ -395,8 +409,10 @@ export function processFinixEvent(db: DB, event: FinixEvent): "APPLIED" | "IGNOR
     return "IGNORED";
   }
   const outcome = transferOutcome(t.state);
+  // Stamp only when blank — never overwrite an already-recorded transfer id
+  // (a different id here would mean two transfers claim one charge).
   db.update(charges)
-    .set({ finixTransferId: t.id, updatedAt: Date.now() })
+    .set({ finixTransferId: charge.finixTransferId ?? t.id, updatedAt: Date.now() })
     .where(eq(charges.id, charge.id))
     .run();
   if (outcome === "pending") {

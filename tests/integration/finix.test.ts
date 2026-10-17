@@ -443,6 +443,109 @@ describe("final-review fixes", () => {
     expect(getCharge(db, "c1").status).toBe("failed");
   });
 
+  it("re-armed pending charge under incomplete_expired blocks a retry (no double-bill)", async () => {
+    db = makeTestDb("finix-pending-dead");
+    const user = seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s1",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "incomplete_expired",
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    db.insert(charges)
+      .values({
+        id: "c1",
+        subscriptionId: "s1",
+        status: "pending", // re-armed by a late PENDING webhook
+        finixTransferId: "TR_late",
+        periodStart: NOW,
+        periodEnd: NOW + periodMs("month"),
+        amountCents: 999,
+        currency: "USD",
+        attemptNo: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const finix = finixStub(() => {
+      throw new Error("no provider calls expected");
+    });
+    await expect(createFinixSubscription(db, finix, user, plan, "PI_2")).rejects.toMatchObject({
+      code: "FINIX_SUB_EXISTS",
+    });
+    expect(db.select().from(subscriptions).all()).toHaveLength(1);
+    expect(db.select().from(charges).all()).toHaveLength(1);
+  });
+
+  it("cross-plan residue blocks inside the reconcile window, allows after expiry", async () => {
+    db = makeTestDb("finix-crossplan");
+    const user = seedUser(db);
+    const basic = seedPlan(db);
+    db.insert(plans)
+      .values({
+        id: "pro",
+        slug: "pro",
+        name: "Pro",
+        priceCents: 2999,
+        currency: "usd",
+        interval: "month",
+        createdAt: NOW,
+      })
+      .run();
+    const pro = must(db.select().from(plans).where(eq(plans.id, "pro")).get(), "pro plan");
+    db.insert(subscriptions)
+      .values({
+        id: "s1",
+        userId: "u1",
+        provider: "finix",
+        planId: basic.id,
+        status: "incomplete_expired",
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    db.insert(charges)
+      .values({
+        id: "c1",
+        subscriptionId: "s1",
+        status: "failed",
+        finixTransferId: null,
+        periodStart: NOW,
+        periodEnd: NOW + periodMs("month"),
+        amountCents: 999,
+        currency: "USD",
+        attemptNo: 1,
+        createdAt: NOW,
+        updatedAt: NOW, // inside the 24h window
+      })
+      .run();
+    const finix = finixStub(() => {
+      throw new Error("no provider calls expected");
+    });
+    await expect(createFinixSubscription(db, finix, user, pro, "PI_2")).rejects.toMatchObject({
+      code: "FINIX_SUB_EXISTS",
+    });
+    // Past the reconcile window the cross-plan retry goes through.
+    db.update(charges)
+      .set({ updatedAt: NOW - 25 * 60 * 60 * 1000 })
+      .where(eq(charges.id, "c1"))
+      .run();
+    const ok = finixStub((path) => {
+      if (path === "/identities") return { id: "ID_1" };
+      if (path.startsWith("/payment_instruments/")) return { id: "PI_2" };
+      return { id: "TR_2", state: "SUCCEEDED" };
+    });
+    const again = await createFinixSubscription(db, ok, user, pro, "PI_2");
+    expect(again.subscription.status).toBe("active");
+    expect(again.subscription.planId).toBe("pro");
+  });
+
   it("NO_INSTRUMENT also fails the charge (no wedged pending)", async () => {
     db = makeTestDb("finix-no-instr2");
     seedUser(db);
