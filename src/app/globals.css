@@ -1,0 +1,29 @@
+:root {
+  color-scheme: light dark;
+}
+body {
+  font-family: system-ui, sans-serif;
+  margin: 0;
+}
+.wrap {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+.plans {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+}
+.plan {
+  border: 1px solid #8884;
+  border-radius: 0.5rem;
+  padding: 1rem;
+}
+.error {
+  color: #c33;
+}
+button,
+.btn {
+  padding: 0.5rem 1rem;
+}
