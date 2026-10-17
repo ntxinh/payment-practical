@@ -78,6 +78,7 @@ export function insertCharge(db: DB, c: NewCharge): Charge {
     amountCents: c.amountCents,
     currency: c.currency,
     attemptNo: c.attemptNo ?? 1,
+    finixTransferId: null,
     status: "pending",
     createdAt: now,
     updatedAt: now,
@@ -101,12 +102,12 @@ export function latestPendingCharge(db: DB, subscriptionId: string): Charge | un
     .select()
     .from(charges)
     .where(and(eq(charges.subscriptionId, subscriptionId), eq(charges.status, "pending")))
-    .orderBy(desc(charges.createdAt))
+    .orderBy(desc(charges.createdAt), desc(charges.id))
     .limit(1)
     .get();
 }
 
-const MAX_FAILURES = 3;
+export const MAX_FAILURES = 3;
 
 /** Applies a settled charge outcome to the charge + its subscription.
  *  paid → active, periodEnd = charge.periodEnd, failures reset.

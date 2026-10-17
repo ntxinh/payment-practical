@@ -2,12 +2,10 @@ import "server-only";
 import { desc, eq } from "drizzle-orm";
 import type { DB } from "@/server/db/client";
 import { type Charge, charges, plans, type Subscription, subscriptions } from "@/server/db/schema";
-import { hasPendingCharge, insertCharge, periodMs } from "./subscriptions";
+import { hasPendingCharge, insertCharge, MAX_FAILURES, periodMs } from "./subscriptions";
 
 export type ChargeFn = (db: DB, sub: Subscription, charge: Charge) => Promise<void>;
 export type TickCounts = { renewed: number; retried: number; canceled: number; skipped: number };
-
-const MAX_FAILURES = 3;
 
 /**
  * Advances finix subscriptions: renewals at period end, retries while
@@ -66,7 +64,7 @@ export async function runBillingTick(db: DB, chargeFn: ChargeFn): Promise<TickCo
         .select()
         .from(charges)
         .where(eq(charges.subscriptionId, sub.id))
-        .orderBy(desc(charges.createdAt))
+        .orderBy(desc(charges.createdAt), desc(charges.id))
         .limit(1)
         .get();
       const plan = sub.planId
