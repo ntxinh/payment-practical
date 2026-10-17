@@ -169,7 +169,7 @@ without these, the local status would drift from Stripe's truth.
 
 ```ts
 type SubscriptionStatus =
-  | "active" | "trialing" | "past_due" | "canceled"
+  | "active" | "trialing" | "past_due" | "canceled" | "paused"
   | "incomplete" | "incomplete_expired" | "unpaid";
 
 const isActive = (s: SubscriptionStatus) => s === "active" || s === "trialing";
