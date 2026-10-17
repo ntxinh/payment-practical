@@ -6,7 +6,13 @@ import { subscriptions, users } from "@/server/db/schema";
 import { processBillingEvent } from "@/server/modules/billing/stripe";
 import { makeTestDb } from "../helpers/db";
 
-const user = { id: "u1", email: "u@x.y", stripeCustomerId: "cus_1", createdAt: Date.now() };
+const user = {
+  id: "u1",
+  email: "u@x.y",
+  stripeCustomerId: "cus_1",
+  finixIdentityId: null,
+  createdAt: Date.now(),
+};
 
 const stripeSub = (over: Partial<Stripe.Subscription> = {}): Stripe.Subscription =>
   ({

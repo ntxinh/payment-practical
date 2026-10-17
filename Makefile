@@ -1,5 +1,5 @@
 .PHONY: setup dev build lint format typecheck test test-unit test-integration \
-        db-generate db-migrate db-seed db-reset stripe-seed check verify
+        db-generate db-migrate db-seed db-reset stripe-seed finix-webhook-seed check verify
 
 setup: ; pnpm install && pnpm next typegen
 dev: ; pnpm dev
@@ -17,5 +17,6 @@ db-migrate: ; NODE_OPTIONS="--conditions=react-server" pnpm tsx --env-file-if-ex
 db-seed: ; NODE_OPTIONS="--conditions=react-server" pnpm tsx --env-file-if-exists=.env scripts/db-seed.ts
 db-reset: ; rm -f data/*.db* && $(MAKE) db-migrate db-seed
 stripe-seed: ; NODE_OPTIONS="--conditions=react-server" pnpm tsx --env-file-if-exists=.env scripts/stripe-seed.ts
+finix-webhook-seed: ; NODE_OPTIONS="--conditions=react-server" pnpm tsx --env-file-if-exists=.env scripts/finix-webhook-seed.ts
 check: lint typecheck test
 verify: check build

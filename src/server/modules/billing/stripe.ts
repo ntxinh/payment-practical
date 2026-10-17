@@ -3,10 +3,11 @@ import { eq } from "drizzle-orm";
 import Stripe from "stripe";
 import { ulid } from "ulidx";
 import type { DB } from "@/server/db/client";
-import { type Plan, subscriptions, type User, users, webhookEvents } from "@/server/db/schema";
+import { type Plan, subscriptions, type User, users } from "@/server/db/schema";
 import { appUrl } from "@/server/env";
 import { BillingError } from "./errors";
 import { mapSubscriptionStatus, type SubscriptionStatus } from "./subscriptions";
+import { recordEvent, seenEvent } from "./webhookEvents";
 
 // process.env (not env.ts) so tests can inject keys after module load.
 let client: Stripe | null | undefined;
@@ -97,19 +98,9 @@ export async function processBillingEvent(
   stripe: Stripe,
   event: Stripe.Event,
 ): Promise<"APPLIED" | "IGNORED"> {
-  const seen = db
-    .select()
-    .from(webhookEvents)
-    .where(eq(webhookEvents.stripeEventId, event.id))
-    .get();
-  if (seen) return "IGNORED";
+  if (seenEvent(db, event.id, "stripe")) return "IGNORED";
 
-  const record = () => {
-    db.insert(webhookEvents)
-      .values({ stripeEventId: event.id, type: event.type, processedAt: Date.now() })
-      .onConflictDoNothing()
-      .run();
-  };
+  const record = () => recordEvent(db, event.id, event.type, "stripe");
 
   let sub: Stripe.Subscription | null = null;
   if (event.type === "checkout.session.completed") {

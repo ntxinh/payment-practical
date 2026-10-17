@@ -10,8 +10,8 @@ app → features → server/modules → server/db
 - `src/features/` — server actions (`auth`, `billing`): parse form data →
   authorize → delegate → serialize/redirect.
 - `src/server/modules/` — business rules. `billing/` holds plan queries,
-  subscription mapping, Stripe session/portal creation, and webhook event
-  processing.
+  subscription mapping, Stripe session/portal creation, the Finix REST
+  client + charge ledger, the billing tick, and webhook event processing.
 - `src/server/db/` — drizzle client + schema only.
 
 Every `src/server/**` file starts with `import "server-only";`, so nothing
@@ -24,17 +24,23 @@ find-or-create) and by app pages/route handlers for reads.
 
 ```
 src/app/login/page.tsx              dev email login
-src/app/pricing/page.tsx            plan picker → subscribe
-src/app/account/billing/page.tsx    status + manageBilling
+src/app/pricing/page.tsx            plan picker → subscribe / Pay with Finix
+src/app/subscribe/finix/page.tsx    Finix.js card iframe → finixSubscribe
+src/app/account/billing/page.tsx    status + portal (stripe) / cancel-at-period-end (finix)
 src/app/api/v1/webhooks/stripe/route.ts  POST → handleStripeWebhook
+src/app/api/v1/webhooks/finix/route.ts   POST → handleFinixWebhook
+src/app/api/v1/billing-tick/route.ts     POST → runBillingTick (x-billing-secret gated)
 src/features/auth/actions.ts        login(email), logout()
-src/features/billing/actions.ts     subscribe(formData), manageBilling()
+src/features/billing/actions.ts     subscribe, manageBilling, finixSubscribe, finixCancel
+src/features/billing/finix-form.tsx Finix.js v1 iframe card fields (client)
 src/server/env.ts                   env accessors w/ dev defaults
 src/server/db/client.ts             better-sqlite3 + drizzle (WAL, FKs on)
-src/server/db/schema.ts             users, plans, subscriptions, webhook_events
+src/server/db/schema.ts             users, plans, subscriptions, payment_instruments,
+                                    charges, webhook_events
 src/server/auth/session.ts          HMAC cookie sign/verify, getCurrentUser()
-src/server/modules/billing/         plans, subscriptions, stripe, errors
-scripts/plans.ts db-migrate.ts db-seed.ts stripe-seed.ts
+src/server/modules/billing/         plans, subscriptions, stripe, finix, tick,
+                                    webhookEvents, errors
+scripts/plans.ts db-migrate.ts db-seed.ts stripe-seed.ts finix-webhook-seed.ts
 ```
 
 ## Why webhooks are the sole writer
@@ -48,6 +54,19 @@ three webhook events (`checkout.session.completed`,
 local `subscriptions` row. Local rows are a read cache; Stripe is truth.
 
 The webhook route verifies the signature, then `processBillingEvent` dedupes
-by `stripe_event_id` and records each event in `webhook_events` at its
-terminal outcome (applied or ignored). Unrecorded errors surface as 5xx so
-Stripe retries and re-processes.
+by `event_id` (provider `stripe`) and records each event in `webhook_events`
+at its terminal outcome (applied or ignored). Unrecorded errors surface as
+5xx so Stripe retries and re-processes.
+
+## Finix asymmetry
+
+Finix has no subscription product, so the provider's lifecycle is inverted:
+the app owns billing. `/subscribe/finix` renders Finix.js iframe fields that
+tokenize the card into a `payment_instrument` (`PI_…` — card data never
+touches this app); `finixSubscribe` creates an `incomplete` subscription +
+first `charges` row and posts a Transfer. `SUCCEEDED` settles immediately;
+otherwise the `transfer` webhook event (deduped on provider `finix`) settles
+it. `runBillingTick` — driven by `POST /api/v1/billing-tick`, a dev-gated
+cron stand-in — is the only path that renews, retries, and applies
+`cancel_at_period_end`. `payment_instruments.user_id` is unique (one card
+per user; re-adding replaces).
