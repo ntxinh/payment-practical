@@ -23,17 +23,17 @@ sibling server modules.
 
 ```
 src/app/login/page.tsx              dev email login
-src/app/pricing/page.tsx            plan picker → createCheckoutSession
-src/app/account/billing/page.tsx    status + createPortalSession
+src/app/pricing/page.tsx            plan picker → subscribe
+src/app/account/billing/page.tsx    status + manageBilling
 src/app/api/v1/webhooks/stripe/route.ts  POST → handleStripeWebhook
 src/features/auth/actions.ts        login(email), logout()
-src/features/billing/actions.ts     createCheckoutSession, createPortalSession
+src/features/billing/actions.ts     subscribe(formData), manageBilling()
 src/server/env.ts                   env accessors w/ dev defaults
 src/server/db/client.ts             better-sqlite3 + drizzle (WAL, FKs on)
 src/server/db/schema.ts             users, plans, subscriptions, webhook_events
 src/server/auth/session.ts          HMAC cookie sign/verify, getCurrentUser()
 src/server/modules/billing/         plans, subscriptions, stripe, errors
-scripts/db-migrate.ts db-seed.ts stripe-seed.ts
+scripts/plans.ts db-migrate.ts db-seed.ts stripe-seed.ts
 ```
 
 ## Why webhooks are the sole writer

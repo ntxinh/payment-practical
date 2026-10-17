@@ -26,7 +26,7 @@ src/
     api/v1/webhooks/stripe/route.ts
   features/
     auth/actions.ts        — login(email), logout()
-    billing/actions.ts     — createCheckoutSession, createPortalSession
+    billing/actions.ts     — subscribe(formData), manageBilling()
   server/
     env.ts                 — process.env accessors, dev defaults
     db/client.ts           — better-sqlite3 + drizzle, WAL, foreign_keys=ON
@@ -38,7 +38,7 @@ src/
       stripe.ts            — getStripe(), session + portal creation,
                              processBillingEvent(), handleStripeWebhook()
 scripts/
-  db-migrate.ts, db-seed.ts, stripe-seed.ts
+  plans.ts, db-migrate.ts, db-seed.ts, stripe-seed.ts
 tests/
   unit/, integration/, helpers/, server-only.stub.ts
 data/app.db                — gitignored
@@ -70,14 +70,14 @@ sequenceDiagram
   participant S as Stripe
   U->>App: POST /login (email)
   App->>U: Set-Cookie session=uid.hmac
-  U->>App: /pricing → createCheckoutSession(planId)
+  U->>App: /pricing → subscribe(planId)
   App->>S: customers get-or-create; checkout.sessions.create(mode=subscription)
   S-->>U: 303 → Checkout
   S->>App: POST /api/v1/webhooks/stripe (checkout.session.completed)
   App->>App: verify signature → webhook_events dedupe → upsert subscription
   S->>App: customer.subscription.updated / .deleted
   App->>App: map Stripe status → subscriptions row
-  U->>App: createPortalSession()
+  U->>App: manageBilling()
   App->>S: billingPortal.sessions.create → 303
 ```
 
