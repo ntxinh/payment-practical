@@ -21,7 +21,11 @@ import {
   handleFinixWebhook,
   processFinixEvent,
 } from "@/server/modules/billing/finix";
-import { insertCharge, periodMs } from "@/server/modules/billing/subscriptions";
+import {
+  getFinixSubscription,
+  insertCharge,
+  periodMs,
+} from "@/server/modules/billing/subscriptions";
 import { makeTestDb } from "../helpers/db";
 
 const NOW = Date.now();
@@ -244,6 +248,124 @@ describe("finix subscribe flow", () => {
     await expect(chargeForPeriod(db, finix, sub, charge)).rejects.toMatchObject({
       code: "FINIX_NO_INSTRUMENT",
     });
+  });
+});
+
+describe("final-review fixes", () => {
+  let db: DB;
+  afterEach(() => db?.$client.close());
+
+  it("thrown transfer → charge failed, sub incomplete_expired, re-subscribe allowed", async () => {
+    db = makeTestDb("finix-throw");
+    const user = seedUser(db);
+    const plan = seedPlan(db);
+    const throwing = finixStub((path) => {
+      if (path === "/identities") return { id: "ID_1" };
+      if (path.startsWith("/payment_instruments/")) return { id: "PI_1" };
+      throw new Error("network down");
+    });
+    await expect(createFinixSubscription(db, throwing, user, plan, "PI_1")).rejects.toThrow(
+      "network down",
+    );
+    const [sub] = db.select().from(subscriptions).all();
+    const [charge] = db.select().from(charges).all();
+    expect(sub.status).toBe("incomplete_expired");
+    expect(charge.status).toBe("failed");
+
+    // Dead sub + failed charge must not block a retry.
+    const ok = finixStub((path) => {
+      if (path === "/identities") return { id: "ID_1" };
+      if (path.startsWith("/payment_instruments/")) return { id: "PI_2" };
+      return { id: "TR_2", state: "SUCCEEDED" };
+    });
+    const again = await createFinixSubscription(db, ok, user, plan, "PI_2");
+    expect(again.subscription.status).toBe("active");
+    expect(db.select().from(subscriptions).all()).toHaveLength(2);
+  });
+
+  it("NO_INSTRUMENT also fails the charge (no wedged pending)", async () => {
+    db = makeTestDb("finix-no-instr2");
+    seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s1",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "active",
+        currentPeriodEnd: NOW,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const charge = insertCharge(db, {
+      subscriptionId: "s1",
+      periodStart: NOW,
+      periodEnd: NOW + periodMs("month"),
+      amountCents: 999,
+      currency: "USD",
+    });
+    const finix = finixStub(() => {
+      throw new Error("no calls expected");
+    });
+    await expect(chargeForPeriod(db, finix, getSub(db, "s1"), charge)).rejects.toMatchObject({
+      code: "FINIX_NO_INSTRUMENT",
+    });
+    expect(getCharge(db, charge.id).status).toBe("failed");
+  });
+
+  it("inactive plan → PLAN_NOT_FOUND", async () => {
+    db = makeTestDb("finix-inactive");
+    const user = seedUser(db);
+    db.insert(plans)
+      .values({
+        id: "dead",
+        slug: "dead",
+        name: "Dead",
+        priceCents: 100,
+        currency: "usd",
+        interval: "month",
+        active: false,
+        createdAt: NOW,
+      })
+      .run();
+    const plan = must(db.select().from(plans).where(eq(plans.id, "dead")).get(), "plan");
+    const finix = finixStub(() => {
+      throw new Error("no calls expected");
+    });
+    await expect(createFinixSubscription(db, finix, user, plan, "PI_1")).rejects.toMatchObject({
+      code: "PLAN_NOT_FOUND",
+    });
+  });
+
+  it("getFinixSubscription finds a live finix sub masked by a newer stripe sub", async () => {
+    db = makeTestDb("finix-shadow");
+    seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "fx1",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "active",
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    db.insert(subscriptions)
+      .values({
+        id: "st1",
+        userId: "u1",
+        provider: "stripe",
+        stripeSubscriptionId: "sub_st",
+        status: "active",
+        createdAt: NOW + 10,
+        updatedAt: NOW + 10,
+      })
+      .run();
+    expect(getFinixSubscription(db, "u1")?.id).toBe("fx1");
   });
 });
 
@@ -504,6 +626,13 @@ describe("fix round 1", () => {
         updatedAt: NOW,
       })
       .run();
+    insertCharge(db, {
+      subscriptionId: "s_live",
+      periodStart: NOW,
+      periodEnd: NOW + periodMs("month"),
+      amountCents: 999,
+      currency: "USD",
+    });
     const finix = finixStub(() => {
       throw new Error("no provider calls expected");
     });
@@ -512,7 +641,7 @@ describe("fix round 1", () => {
       code: "FINIX_SUB_EXISTS",
     });
     expect(db.select().from(subscriptions).all()).toHaveLength(1);
-    expect(db.select().from(charges).all()).toHaveLength(0);
+    expect(db.select().from(charges).all()).toHaveLength(1); // just the seed — no new charge
   });
 
   it("retry allowed after incomplete_expired (dead sub doesn't block)", async () => {

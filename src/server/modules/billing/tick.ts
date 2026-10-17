@@ -60,6 +60,14 @@ export async function runBillingTick(db: DB, chargeFn: ChargeFn): Promise<TickCo
       continue;
     }
     if (sub.status === "past_due") {
+      if (sub.cancelAtPeriodEnd) {
+        db.update(subscriptions)
+          .set({ status: "canceled", updatedAt: now })
+          .where(eq(subscriptions.id, sub.id))
+          .run();
+        counts.canceled += 1;
+        continue;
+      }
       const last = db
         .select()
         .from(charges)

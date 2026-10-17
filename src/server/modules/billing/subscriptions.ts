@@ -1,5 +1,5 @@
 import "server-only";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { ulid } from "ulidx";
 import type { DB } from "@/server/db/client";
 import {
@@ -45,6 +45,24 @@ export function getLatestSubscription(db: DB, userId: string): Subscription | un
     .select()
     .from(subscriptions)
     .where(eq(subscriptions.userId, userId))
+    .orderBy(desc(subscriptions.updatedAt), desc(subscriptions.id))
+    .limit(1)
+    .get();
+}
+
+/** Latest finix sub in a live status — immune to newer cross-provider rows
+ *  shadowing it (the getLatestSubscription pitfall). */
+export function getFinixSubscription(db: DB, userId: string): Subscription | undefined {
+  return db
+    .select()
+    .from(subscriptions)
+    .where(
+      and(
+        eq(subscriptions.userId, userId),
+        eq(subscriptions.provider, "finix"),
+        inArray(subscriptions.status, ["incomplete", "active", "past_due"]),
+      ),
+    )
     .orderBy(desc(subscriptions.updatedAt), desc(subscriptions.id))
     .limit(1)
     .get();

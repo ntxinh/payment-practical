@@ -9,7 +9,7 @@ import { BillingError } from "@/server/modules/billing/errors";
 import { createFinixSubscription, getFinix } from "@/server/modules/billing/finix";
 import { getPlanById } from "@/server/modules/billing/plans";
 import { checkoutUrlForPlan, portalUrlForUser } from "@/server/modules/billing/stripe";
-import { getLatestSubscription } from "@/server/modules/billing/subscriptions";
+import { getFinixSubscription } from "@/server/modules/billing/subscriptions";
 
 export async function subscribe(formData: FormData): Promise<void> {
   const user = await getCurrentUser();
@@ -68,8 +68,8 @@ export async function finixSubscribe(formData: FormData): Promise<void> {
 export async function finixCancel(): Promise<void> {
   const user = await getCurrentUser();
   if (!user) redirect("/login");
-  const sub = getLatestSubscription(getDb(), user.id);
-  if (sub?.provider === "finix") {
+  const sub = getFinixSubscription(getDb(), user.id);
+  if (sub) {
     getDb()
       .update(subscriptions)
       .set({ cancelAtPeriodEnd: true, updatedAt: Date.now() })

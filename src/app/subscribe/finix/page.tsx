@@ -13,7 +13,7 @@ export default async function FinixSubscribePage({
   if (!user) redirect("/login");
   const { plan: planId } = await searchParams;
   const plan = getPlanById(getDb(), planId ?? "");
-  if (!plan) redirect("/pricing?error=PLAN_NOT_FOUND");
+  if (!plan?.active) redirect("/pricing?error=PLAN_NOT_FOUND");
   const applicationId = process.env.FINIX_APPLICATION_ID;
   if (!applicationId) redirect("/pricing?error=FINIX_NOT_CONFIGURED");
   return (

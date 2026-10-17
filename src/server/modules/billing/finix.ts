@@ -14,7 +14,13 @@ import {
   users,
 } from "@/server/db/schema";
 import { BillingError } from "./errors";
-import { applyChargeOutcome, insertCharge, latestPendingCharge, periodMs } from "./subscriptions";
+import {
+  applyChargeOutcome,
+  hasPendingCharge,
+  insertCharge,
+  latestPendingCharge,
+  periodMs,
+} from "./subscriptions";
 import { recordEvent, seenEvent } from "./webhookEvents";
 
 const DEFAULT_BASE = "https://finix.sandbox-payments-api.com";
@@ -202,21 +208,27 @@ export async function createFinixSubscription(
   plan: Plan,
   paymentInstrumentId: string,
 ): Promise<{ subscription: Subscription; charge: Charge }> {
-  // Retry guard: userId isn't unique on subscriptions — refuse a second live
-  // finix sub regardless of what stripe rows the user has picked up since.
-  const LIVE = ["incomplete", "active", "past_due"];
-  const existing = db
-    .select({ id: subscriptions.id })
+  // Retry guard: a live finix sub (active/past_due, or incomplete with an
+  // in-flight charge) blocks a second subscribe — regardless of newer rows
+  // in any provider. Dead subs (canceled/incomplete_expired, or incomplete
+  // with only failed charges) don't block retries.
+  const blocking = db
+    .select({ id: subscriptions.id, status: subscriptions.status })
     .from(subscriptions)
     .where(
       and(
         eq(subscriptions.userId, user.id),
         eq(subscriptions.provider, "finix"),
-        inArray(subscriptions.status, LIVE),
+        inArray(subscriptions.status, ["incomplete", "active", "past_due"]),
       ),
     )
-    .get();
-  if (existing) throw new BillingError("FINIX_SUB_EXISTS");
+    .all();
+  for (const sub of blocking) {
+    if (sub.status !== "incomplete" || hasPendingCharge(db, sub.id)) {
+      throw new BillingError("FINIX_SUB_EXISTS");
+    }
+  }
+  if (!plan.active) throw new BillingError("PLAN_NOT_FOUND");
   const identityId = await ensureIdentity(db, finix, user);
   await attachInstrument(finix, identityId, paymentInstrumentId);
   const now = Date.now();
@@ -284,15 +296,29 @@ export async function chargeForPeriod(
     .from(paymentInstruments)
     .where(eq(paymentInstruments.userId, sub.userId))
     .get();
-  if (!instrument) throw new BillingError("FINIX_NO_INSTRUMENT");
-  const t = await postTransfer(finix, {
-    amount: charge.amountCents,
-    currency: charge.currency,
-    source: instrument.finixInstrumentId,
-    merchant_id: finix.merchantId,
-    idempotency_id: charge.id,
-    tags: { chargeId: charge.id, subscriptionId: sub.id },
-  });
+  if (!instrument) {
+    // Same wedging rule as a thrown transfer: no webhook will ever settle.
+    applyChargeOutcome(db, charge, "failed");
+    charge.status = "failed";
+    throw new BillingError("FINIX_NO_INSTRUMENT");
+  }
+  let t: FinixTransfer;
+  try {
+    t = await postTransfer(finix, {
+      amount: charge.amountCents,
+      currency: charge.currency,
+      source: instrument.finixInstrumentId,
+      merchant_id: finix.merchantId,
+      idempotency_id: charge.id,
+      tags: { chargeId: charge.id, subscriptionId: sub.id },
+    });
+  } catch (e) {
+    // A thrown transfer leaves no webhook to settle the charge — mark it
+    // failed so the sub isn't wedged pending forever, then propagate.
+    applyChargeOutcome(db, charge, "failed");
+    charge.status = "failed";
+    throw e;
+  }
   charge.finixTransferId = t.id ?? null;
   db.update(charges)
     .set({ finixTransferId: charge.finixTransferId, updatedAt: Date.now() })

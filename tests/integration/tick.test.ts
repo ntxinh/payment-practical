@@ -165,6 +165,38 @@ describe("runBillingTick", () => {
     expect(calls[0].periodEnd).toBe(PAST + periodMs("month"));
   });
 
+  it("past_due + cancelAtPeriodEnd → canceled without retry", async () => {
+    db = makeTestDb("tick-cancel-pastdue");
+    seedBase(db);
+    const sub = insertSub(
+      db,
+      finixSub({
+        status: "past_due",
+        consecutiveFailures: 1,
+        cancelAtPeriodEnd: true,
+        currentPeriodEnd: PAST,
+      }),
+    );
+    const prev = insertCharge(db, {
+      subscriptionId: sub.id,
+      periodStart: PAST - 30 * DAY,
+      periodEnd: PAST,
+      amountCents: 999,
+      currency: "USD",
+      attemptNo: 1,
+    });
+    db.update(charges).set({ status: "failed" }).where(eq(charges.id, prev.id)).run();
+
+    const calls: Charge[] = [];
+    const counts = await runBillingTick(db, async (_d, _s, c) => {
+      calls.push(c);
+    });
+
+    expect(counts).toEqual({ renewed: 0, retried: 0, canceled: 1, skipped: 0 });
+    expect(calls).toHaveLength(0);
+    expect(getSub(db, sub.id).status).toBe("canceled");
+  });
+
   it("past_due + failures=2 + failed retry → canceled via applyChargeOutcome (3rd failure)", async () => {
     db = makeTestDb("tick-3rd-fail");
     seedBase(db);
