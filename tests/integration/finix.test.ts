@@ -456,3 +456,89 @@ describe("handleFinixWebhook", () => {
     expect(handleFinixWebhook(db, payload, sign(payload))).toEqual({ status: 200 });
   });
 });
+
+describe("fix round 1", () => {
+  let db: DB;
+  beforeEach(() => {
+    vi.stubEnv("FINIX_WEBHOOK_SECRET", SECRET);
+    vi.stubEnv("FINIX_USERNAME", "u");
+    vi.stubEnv("FINIX_PASSWORD", "p");
+    vi.stubEnv("FINIX_MERCHANT_ID", "MU_x");
+    vi.stubEnv("FINIX_APPLICATION_ID", "AP_x");
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    db?.$client.close();
+  });
+
+  it("400 when a fresh timestamp is prepended to a stale signed delivery (last-wins parse)", () => {
+    db = makeTestDb("finix-wh-prepend");
+    const payload = JSON.stringify({ entity: "transfer", data: {} });
+    const stale = Math.floor(Date.now() / 1000) - 301;
+    // Sig is over the OLD timestamp; attacker prepends a fresh one.
+    const header = `timestamp=${Math.floor(Date.now() / 1000)},${sign(payload, stale)}`;
+    expect(handleFinixWebhook(db, payload, header)).toEqual({ status: 400 });
+  });
+
+  it("200 when the sig itself is fresh and prepended junk is ignored", () => {
+    db = makeTestDb("finix-wh-prepend-ok");
+    const payload = JSON.stringify({ entity: "transfer", data: {} });
+    // Junk key first, valid header entries after — parse takes the real ts/sig.
+    const header = `junk=1,${sign(payload)}`;
+    expect(handleFinixWebhook(db, payload, header)).toEqual({ status: 200 });
+  });
+
+  it("FINIX_SUB_EXISTS when the user already has a live finix sub", async () => {
+    db = makeTestDb("finix-sub-exists");
+    const user = seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s_live",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "incomplete",
+        currentPeriodEnd: NOW,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const finix = finixStub(() => {
+      throw new Error("no provider calls expected");
+    });
+    await expect(createFinixSubscription(db, finix, user, plan, "PI_1")).rejects.toMatchObject({
+      name: "BillingError",
+      code: "FINIX_SUB_EXISTS",
+    });
+    expect(db.select().from(subscriptions).all()).toHaveLength(1);
+    expect(db.select().from(charges).all()).toHaveLength(0);
+  });
+
+  it("retry allowed after incomplete_expired (dead sub doesn't block)", async () => {
+    db = makeTestDb("finix-sub-retry");
+    const user = seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s_dead",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "incomplete_expired",
+        currentPeriodEnd: NOW,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const finix = finixStub((path) => {
+      if (path === "/identities") return { id: "ID_1" };
+      if (path.startsWith("/payment_instruments/")) return { id: "PI_1" };
+      return { id: "TR_1", state: "SUCCEEDED" };
+    });
+    const { subscription } = await createFinixSubscription(db, finix, user, plan, "PI_1");
+    expect(subscription.id).not.toBe("s_dead");
+    expect(subscription.status).toBe("active");
+    expect(db.select().from(subscriptions).all()).toHaveLength(2);
+  });
+});

@@ -7,7 +7,8 @@ export type BillingErrorCode =
   | "NO_STRIPE_CUSTOMER"
   | "FINIX_NOT_CONFIGURED"
   | "FINIX_INSTRUMENT_INVALID"
-  | "FINIX_NO_INSTRUMENT";
+  | "FINIX_NO_INSTRUMENT"
+  | "FINIX_SUB_EXISTS";
 
 export class BillingError extends Error {
   constructor(readonly code: BillingErrorCode) {

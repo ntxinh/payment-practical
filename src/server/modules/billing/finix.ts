@@ -14,7 +14,13 @@ import {
   users,
 } from "@/server/db/schema";
 import { BillingError } from "./errors";
-import { applyChargeOutcome, insertCharge, latestPendingCharge, periodMs } from "./subscriptions";
+import {
+  applyChargeOutcome,
+  getLatestSubscription,
+  insertCharge,
+  latestPendingCharge,
+  periodMs,
+} from "./subscriptions";
 import { recordEvent, seenEvent } from "./webhookEvents";
 
 const DEFAULT_BASE = "https://finix.sandbox-payments-api.com";
@@ -113,22 +119,33 @@ export function transferOutcome(state: string | null | undefined): "paid" | "fai
   return "pending";
 }
 
+/** Single canonical parse of `timestamp=<epoch>,sig=<hex>` — shared by
+ *  verify + freshness so duplicate keys can't diverge (last wins, like
+ *  Object.fromEntries). Returns undefined on malformed shape. */
+function parseFinixSignatureHeader(
+  signatureHeader: string | null,
+): { ts: string; sig: string } | undefined {
+  if (!signatureHeader) return undefined;
+  const parts = Object.fromEntries(
+    signatureHeader.split(",").map((kv) => kv.trim().split("=", 2) as [string, string]),
+  );
+  const ts = parts.timestamp;
+  const sig = parts.sig;
+  if (!ts || !sig || !/^\d+$/.test(ts) || !/^[0-9a-f]{64}$/i.test(sig)) return undefined;
+  return { ts, sig };
+}
+
 /** Finix-Signature: `timestamp=<epoch>,sig=<hex>`; sig = HMAC-SHA256(`${ts}:${rawBody}`, secret). */
 export function verifyFinixSignature(
   payload: string,
   signatureHeader: string | null,
   secret: string,
 ): boolean {
-  if (!signatureHeader) return false;
-  const parts = Object.fromEntries(
-    signatureHeader.split(",").map((kv) => kv.trim().split("=", 2) as [string, string]),
-  );
-  const ts = parts.timestamp;
-  const sig = parts.sig;
-  if (!ts || !sig || !/^\d+$/.test(ts) || !/^[0-9a-f]{64}$/i.test(sig)) return false;
-  const expected = createHmac("sha256", secret).update(`${ts}:${payload}`).digest("hex");
+  const parts = parseFinixSignatureHeader(signatureHeader);
+  if (!parts) return false;
+  const expected = createHmac("sha256", secret).update(`${parts.ts}:${payload}`).digest("hex");
   const a = Buffer.from(expected, "hex");
-  const b = Buffer.from(sig, "hex");
+  const b = Buffer.from(parts.sig, "hex");
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
@@ -191,6 +208,17 @@ export async function createFinixSubscription(
   plan: Plan,
   paymentInstrumentId: string,
 ): Promise<{ subscription: Subscription; charge: Charge }> {
+  // Retry guard: userId isn't unique on subscriptions — refuse a second live
+  // finix sub (stripe subs for the same user are out of scope here).
+  const existing = getLatestSubscription(db, user.id);
+  if (
+    existing?.provider === "finix" &&
+    (existing.status === "incomplete" ||
+      existing.status === "active" ||
+      existing.status === "past_due")
+  ) {
+    throw new BillingError("FINIX_SUB_EXISTS");
+  }
   const identityId = await ensureIdentity(db, finix, user);
   await attachInstrument(finix, identityId, paymentInstrumentId);
   const now = Date.now();
@@ -238,7 +266,10 @@ export async function createFinixSubscription(
   const sub = db.select().from(subscriptions).where(eq(subscriptions.id, subId)).get();
   if (!sub) throw new Error("inserted subscription not found");
   await chargeForPeriod(db, finix, sub, charge);
-  return { subscription: sub, charge };
+  // Re-select: the fast path may have settled the sub (incomplete → active/…).
+  const settled = db.select().from(subscriptions).where(eq(subscriptions.id, subId)).get();
+  if (!settled) throw new Error("inserted subscription not found");
+  return { subscription: settled, charge };
 }
 
 /** Charges one period. Terminal transfer states apply immediately (and mark
@@ -323,15 +354,10 @@ export function handleFinixWebhook(
 ): { status: number } {
   const secret = process.env.FINIX_WEBHOOK_SECRET;
   if (!secret || !finixConfigured() || !signatureHeader) return { status: 404 };
-  if (!verifyFinixSignature(payload, signatureHeader, secret)) return { status: 400 };
-  const ts = Number(
-    signatureHeader
-      .split(",")
-      .map((kv) => kv.trim())
-      .find((kv) => kv.startsWith("timestamp="))
-      ?.slice("timestamp=".length),
-  );
-  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > MAX_SIG_SKEW_S) {
+  // Same `parts` object feeds verify + freshness — the ts under the HMAC is the ts we gate on.
+  const parts = parseFinixSignatureHeader(signatureHeader);
+  if (!parts || !verifyFinixSignature(payload, signatureHeader, secret)) return { status: 400 };
+  if (Math.abs(Date.now() / 1000 - Number(parts.ts)) > MAX_SIG_SKEW_S) {
     return { status: 400 };
   }
   const event = JSON.parse(payload) as FinixEvent;
