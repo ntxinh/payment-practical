@@ -26,7 +26,7 @@ export function getLatestSubscription(db: DB, userId: string): Subscription | un
     .select()
     .from(subscriptions)
     .where(eq(subscriptions.userId, userId))
-    .orderBy(desc(subscriptions.updatedAt))
+    .orderBy(desc(subscriptions.updatedAt), desc(subscriptions.id))
     .limit(1)
     .get();
 }

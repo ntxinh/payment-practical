@@ -62,7 +62,8 @@ export async function portalUrlForUser(user: User): Promise<string> {
 
 function resolveUserId(db: DB, sub: Stripe.Subscription): string | undefined {
   const fromMeta = sub.metadata?.userId;
-  if (fromMeta) return fromMeta;
+  // Verify metadata userId exists — a bad id would throw on FK and poison retries.
+  if (fromMeta && db.select().from(users).where(eq(users.id, fromMeta)).get()) return fromMeta;
   const customerId = typeof sub.customer === "string" ? sub.customer : sub.customer?.id;
   if (!customerId) return undefined;
   return db.select().from(users).where(eq(users.stripeCustomerId, customerId)).get()?.id;
@@ -85,37 +86,56 @@ function upsertSubscription(db: DB, sub: Stripe.Subscription, userId: string): v
 }
 
 /**
- * Applies one verified event. Dedupes on event id via webhook_events before
- * doing any work. Events we can't associate with a user are recorded and
- * IGNORED so Stripe stops retrying.
+ * Applies one verified event. Checks webhook_events for the id first — replayed
+ * events are IGNORED. The row is recorded only at terminal outcomes (APPLIED or
+ * terminal IGNORED) so a thrown error leaves no trace and Stripe's retry
+ * re-processes. Events we can't associate with a user are recorded and IGNORED
+ * so Stripe stops retrying. Safe because better-sqlite3 is synchronous.
  */
 export async function processBillingEvent(
   db: DB,
   stripe: Stripe,
   event: Stripe.Event,
 ): Promise<"APPLIED" | "IGNORED"> {
-  const dedupe = db
-    .insert(webhookEvents)
-    .values({ stripeEventId: event.id, type: event.type, processedAt: Date.now() })
-    .onConflictDoNothing()
-    .run();
-  if (dedupe.changes === 0) return "IGNORED";
+  const seen = db
+    .select()
+    .from(webhookEvents)
+    .where(eq(webhookEvents.stripeEventId, event.id))
+    .get();
+  if (seen) return "IGNORED";
+
+  const record = () => {
+    db.insert(webhookEvents)
+      .values({ stripeEventId: event.id, type: event.type, processedAt: Date.now() })
+      .onConflictDoNothing()
+      .run();
+  };
 
   let sub: Stripe.Subscription | null = null;
   if (event.type === "checkout.session.completed") {
     const session = event.data.object as Stripe.Checkout.Session;
     const subId = typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
-    if (session.mode !== "subscription" || !subId) return "IGNORED";
-    // Errors propagate → route 500s → Stripe retries.
+    if (session.mode !== "subscription" || !subId) {
+      record();
+      return "IGNORED";
+    }
+    // Errors propagate unrecorded → route 500s → Stripe retries and re-processes.
     sub = await stripe.subscriptions.retrieve(subId);
   } else if (event.type.startsWith("customer.subscription.")) {
     sub = event.data.object as Stripe.Subscription;
   }
-  if (!sub) return "IGNORED";
+  if (!sub) {
+    record();
+    return "IGNORED";
+  }
 
   const userId = resolveUserId(db, sub);
-  if (!userId) return "IGNORED";
+  if (!userId) {
+    record();
+    return "IGNORED";
+  }
   upsertSubscription(db, sub, userId);
+  record();
   return "APPLIED";
 }
 

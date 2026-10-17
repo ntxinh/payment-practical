@@ -84,4 +84,22 @@ describe("processBillingEvent", () => {
     const bare = { ...user, stripeCustomerId: null };
     await expect(portalUrlForUser(bare)).rejects.toMatchObject({ code: "NO_STRIPE_CUSTOMER" });
   });
+  it("thrown retrieve error is NOT recorded → same event id re-processes on retry", async () => {
+    seed();
+    let calls = 0;
+    const flaky = {
+      subscriptions: {
+        retrieve: async () => {
+          calls += 1;
+          if (calls === 1) throw new Error("stripe 503");
+          return stripeSub();
+        },
+      },
+    } as unknown as Stripe;
+    const e = event("checkout.session.completed", { mode: "subscription", subscription: "sub_1" });
+    await expect(processBillingEvent(db, flaky, e)).rejects.toThrow("stripe 503");
+    expect(await processBillingEvent(db, flaky, e)).toBe("APPLIED");
+    expect(db.select().from(subscriptions).all()).toHaveLength(1);
+    expect(calls).toBe(2);
+  });
 });
