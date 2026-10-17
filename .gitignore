@@ -1,0 +1,8 @@
+# .gitignore
+node_modules/
+.next/
+data/*.db*
+tests/.tmp/
+.env
+*.tsbuildinfo
+next-env.d.ts
