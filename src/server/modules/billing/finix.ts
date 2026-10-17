@@ -1,6 +1,6 @@
 import "server-only";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { ulid } from "ulidx";
 import type { DB } from "@/server/db/client";
 import {
@@ -14,13 +14,7 @@ import {
   users,
 } from "@/server/db/schema";
 import { BillingError } from "./errors";
-import {
-  applyChargeOutcome,
-  getLatestSubscription,
-  insertCharge,
-  latestPendingCharge,
-  periodMs,
-} from "./subscriptions";
+import { applyChargeOutcome, insertCharge, latestPendingCharge, periodMs } from "./subscriptions";
 import { recordEvent, seenEvent } from "./webhookEvents";
 
 const DEFAULT_BASE = "https://finix.sandbox-payments-api.com";
@@ -209,16 +203,20 @@ export async function createFinixSubscription(
   paymentInstrumentId: string,
 ): Promise<{ subscription: Subscription; charge: Charge }> {
   // Retry guard: userId isn't unique on subscriptions — refuse a second live
-  // finix sub (stripe subs for the same user are out of scope here).
-  const existing = getLatestSubscription(db, user.id);
-  if (
-    existing?.provider === "finix" &&
-    (existing.status === "incomplete" ||
-      existing.status === "active" ||
-      existing.status === "past_due")
-  ) {
-    throw new BillingError("FINIX_SUB_EXISTS");
-  }
+  // finix sub regardless of what stripe rows the user has picked up since.
+  const LIVE = ["incomplete", "active", "past_due"];
+  const existing = db
+    .select({ id: subscriptions.id })
+    .from(subscriptions)
+    .where(
+      and(
+        eq(subscriptions.userId, user.id),
+        eq(subscriptions.provider, "finix"),
+        inArray(subscriptions.status, LIVE),
+      ),
+    )
+    .get();
+  if (existing) throw new BillingError("FINIX_SUB_EXISTS");
   const identityId = await ensureIdentity(db, finix, user);
   await attachInstrument(finix, identityId, paymentInstrumentId);
   const now = Date.now();

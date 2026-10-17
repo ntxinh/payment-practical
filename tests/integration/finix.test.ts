@@ -542,3 +542,48 @@ describe("fix round 1", () => {
     expect(db.select().from(subscriptions).all()).toHaveLength(2);
   });
 });
+
+describe("fix round 2", () => {
+  let db: DB;
+  afterEach(() => db?.$client.close());
+
+  it("newer stripe sub does not mask a live finix sub (FINIX_SUB_EXISTS)", async () => {
+    db = makeTestDb("finix-sub-masked");
+    const user = seedUser(db);
+    const plan = seedPlan(db);
+    // live finix sub created earlier
+    db.insert(subscriptions)
+      .values({
+        id: "s_finix",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "active",
+        currentPeriodEnd: NOW + 1000,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    // a newer stripe sub — getLatestSubscription would return this one
+    db.insert(subscriptions)
+      .values({
+        id: "s_stripe",
+        userId: "u1",
+        provider: "stripe",
+        stripeSubscriptionId: "stripe_sub_1",
+        status: "active",
+        currentPeriodEnd: NOW + 2000,
+        createdAt: NOW + 10_000,
+        updatedAt: NOW + 10_000,
+      })
+      .run();
+    const finix = finixStub(() => {
+      throw new Error("no provider calls expected");
+    });
+    await expect(createFinixSubscription(db, finix, user, plan, "PI_1")).rejects.toMatchObject({
+      name: "BillingError",
+      code: "FINIX_SUB_EXISTS",
+    });
+    expect(db.select().from(subscriptions).all()).toHaveLength(2);
+  });
+});
