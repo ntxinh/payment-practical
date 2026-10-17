@@ -31,9 +31,9 @@ via Drizzle (Postgres-portable). Dev-only email auth — NOT production auth.
   writers. Never set subscription status in app code.
 - Finix asymmetry: card iframe → `payment_instruments` (one card per user,
   `user_id` unique — re-adding replaces); `charges` is the payment ledger
-  (charge id = transfer idempotency key). Only `runBillingTick` +
-  `/api/v1/webhooks/finix` advance finix status; `finixCancel` just flags
-  `cancel_at_period_end` for the tick to apply.
+  (charge id = transfer idempotency key). Finix status advances via
+  `runBillingTick`, the webhook, or the subscribe fast-path settlement;
+  `finixCancel` just flags `cancel_at_period_end` for the tick to apply.
 - Idempotent webhook processing via the `webhook_events` table; a row is
   recorded at terminal outcomes (applied or ignored), never before work.
 - `current_period_end` is on `SubscriptionItem`, not `Subscription`.

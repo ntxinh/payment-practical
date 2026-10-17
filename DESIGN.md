@@ -128,7 +128,8 @@ Webhook: `POST /api/v1/webhooks/finix` verifies
 `Finix-Signature: timestamp=…,sig=…` (HMAC-SHA256 of `${ts}:${body}`, 300s
 freshness gate), dedupes transfer events via `webhook_events`, resolves the
 charge via `tags.chargeId` (fallback: latest pending for the subscription),
-and applies terminal outcomes. Only tick + webhook advance finix status.
+and applies terminal outcomes. Finix status advances via `runBillingTick`,
+the webhook, and the subscribe fast-path settlement.
 
 ## Errors
 

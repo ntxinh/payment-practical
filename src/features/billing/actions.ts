@@ -54,7 +54,15 @@ export async function finixSubscribe(formData: FormData): Promise<void> {
     if (e instanceof BillingError) redirect(`/pricing?error=${e.code}`);
     throw e;
   }
-  redirect(`/account/billing?${chargeStatus === "paid" ? "success=1" : "pending=1"}`);
+  // A failed first charge is already terminal (incomplete_expired) — send
+  // the user to an error, not the "still processing" notice.
+  const q =
+    chargeStatus === "paid"
+      ? "success=1"
+      : chargeStatus === "failed"
+        ? "error=CHARGE_FAILED"
+        : "pending=1";
+  redirect(`/account/billing?${q}`);
 }
 
 export async function finixCancel(): Promise<void> {
