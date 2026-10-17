@@ -4,7 +4,10 @@ export type BillingErrorCode =
   | "UNAUTHENTICATED"
   | "PLAN_NOT_FOUND"
   | "STRIPE_NOT_CONFIGURED"
-  | "NO_STRIPE_CUSTOMER";
+  | "NO_STRIPE_CUSTOMER"
+  | "FINIX_NOT_CONFIGURED"
+  | "FINIX_INSTRUMENT_INVALID"
+  | "FINIX_NO_INSTRUMENT";
 
 export class BillingError extends Error {
   constructor(readonly code: BillingErrorCode) {
