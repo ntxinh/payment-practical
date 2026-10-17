@@ -7,7 +7,7 @@ import { migrate } from "drizzle-orm/better-sqlite3/migrator";
 import { dbPath } from "@/server/env";
 import * as schema from "./schema";
 
-export type DB = BetterSQLite3Database<typeof schema>;
+export type DB = BetterSQLite3Database<typeof schema> & { $client: Database.Database };
 
 export function createDb(path: string): DB {
   mkdirSync(dirname(path), { recursive: true });
