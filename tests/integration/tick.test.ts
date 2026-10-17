@@ -151,7 +151,10 @@ describe("runBillingTick", () => {
       currency: "USD",
       attemptNo: 1,
     });
-    db.update(charges).set({ status: "failed" }).where(eq(charges.id, prev.id)).run();
+    db.update(charges)
+      .set({ status: "failed", finixTransferId: "TR_prev" }) // stamped = normal settled failure
+      .where(eq(charges.id, prev.id))
+      .run();
 
     const calls: Charge[] = [];
     const counts = await runBillingTick(db, async (_d, _s, c) => {
@@ -163,6 +166,38 @@ describe("runBillingTick", () => {
     expect(calls[0].attemptNo).toBe(2);
     expect(calls[0].periodStart).toBe(PAST);
     expect(calls[0].periodEnd).toBe(PAST + periodMs("month"));
+  });
+
+  it("past_due + last charge failed w/o transfer id → retries the SAME charge (idempotency)", async () => {
+    db = makeTestDb("tick-reuse");
+    seedBase(db);
+    const sub = insertSub(
+      db,
+      finixSub({ status: "past_due", consecutiveFailures: 1, currentPeriodEnd: PAST }),
+    );
+    const prev = insertCharge(db, {
+      subscriptionId: sub.id,
+      periodStart: PAST - 30 * DAY,
+      periodEnd: PAST,
+      amountCents: 999,
+      currency: "USD",
+      attemptNo: 1,
+    });
+    // Simulate the postTransfer-throw path: failed, never stamped.
+    db.update(charges)
+      .set({ status: "failed", finixTransferId: null })
+      .where(eq(charges.id, prev.id))
+      .run();
+
+    const calls: Charge[] = [];
+    const counts = await runBillingTick(db, async (_d, _s, c) => {
+      calls.push(c);
+    });
+
+    expect(counts).toEqual({ renewed: 0, retried: 1, canceled: 0, skipped: 0 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].id).toBe(prev.id); // same row → same idempotency key
+    expect(getCharges(db, sub.id)).toHaveLength(1); // no second charge row
   });
 
   it("past_due + cancelAtPeriodEnd → canceled without retry", async () => {

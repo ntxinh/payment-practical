@@ -82,14 +82,22 @@ export async function runBillingTick(db: DB, chargeFn: ChargeFn): Promise<TickCo
         counts.skipped += 1;
         continue;
       }
-      const charge = insertCharge(db, {
-        subscriptionId: sub.id,
-        periodStart: last.periodEnd,
-        periodEnd: last.periodEnd + periodMs(plan.interval),
-        amountCents: last.amountCents,
-        currency: last.currency,
-        attemptNo: last.attemptNo + 1,
-      });
+      let charge: Charge;
+      if (last.status === "failed" && last.finixTransferId === null) {
+        // The transfer was posted once but never stamped — re-attempt the SAME
+        // charge row so its id stays the idempotency key. A fresh row would let
+        // a silently-committed first transfer bill twice.
+        charge = last;
+      } else {
+        charge = insertCharge(db, {
+          subscriptionId: sub.id,
+          periodStart: last.periodEnd,
+          periodEnd: last.periodEnd + periodMs(plan.interval),
+          amountCents: last.amountCents,
+          currency: last.currency,
+          attemptNo: last.attemptNo + 1,
+        });
+      }
       await chargeFn(db, sub, charge);
       counts.retried += 1;
     }

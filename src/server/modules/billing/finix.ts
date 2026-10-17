@@ -1,6 +1,6 @@
 import "server-only";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import { ulid } from "ulidx";
 import type { DB } from "@/server/db/client";
 import {
@@ -14,13 +14,7 @@ import {
   users,
 } from "@/server/db/schema";
 import { BillingError } from "./errors";
-import {
-  applyChargeOutcome,
-  hasPendingCharge,
-  insertCharge,
-  latestPendingCharge,
-  periodMs,
-} from "./subscriptions";
+import { applyChargeOutcome, insertCharge, latestPendingCharge, periodMs } from "./subscriptions";
 import { recordEvent, seenEvent } from "./webhookEvents";
 
 const DEFAULT_BASE = "https://finix.sandbox-payments-api.com";
@@ -208,24 +202,41 @@ export async function createFinixSubscription(
   plan: Plan,
   paymentInstrumentId: string,
 ): Promise<{ subscription: Subscription; charge: Charge }> {
-  // Retry guard: a live finix sub (active/past_due, or incomplete with an
-  // in-flight charge) blocks a second subscribe — regardless of newer rows
-  // in any provider. Dead subs (canceled/incomplete_expired, or incomplete
-  // with only failed charges) don't block retries.
-  const blocking = db
-    .select({ id: subscriptions.id, status: subscriptions.status })
+  // Retry guard. Live subs (active/past_due, or incomplete with an in-flight
+  // charge) block — regardless of newer rows in any provider. A DEAD residue —
+  // sub dead because its charge failed before a transfer id was ever recorded
+  // (the postTransfer-throw path) — is retried IN PLACE: the transfer may still
+  // exist provider-side, and only reusing its charge id as idempotency key
+  // keeps a retry from double-billing. Cross-plan residue is blocked outright.
+  const candidates = db
+    .select()
     .from(subscriptions)
     .where(
       and(
         eq(subscriptions.userId, user.id),
         eq(subscriptions.provider, "finix"),
-        inArray(subscriptions.status, ["incomplete", "active", "past_due"]),
+        inArray(subscriptions.status, ["incomplete", "active", "past_due", "incomplete_expired"]),
       ),
     )
     .all();
-  for (const sub of blocking) {
-    if (sub.status !== "incomplete" || hasPendingCharge(db, sub.id)) {
+  let residue: { sub: Subscription; charge: Charge } | undefined;
+  for (const sub of candidates) {
+    if (sub.status === "active" || sub.status === "past_due") {
       throw new BillingError("FINIX_SUB_EXISTS");
+    }
+    const last = db
+      .select()
+      .from(charges)
+      .where(eq(charges.subscriptionId, sub.id))
+      .orderBy(desc(charges.createdAt), desc(charges.id))
+      .limit(1)
+      .get();
+    if (sub.status === "incomplete" && last?.status === "pending") {
+      throw new BillingError("FINIX_SUB_EXISTS");
+    }
+    if (last?.status === "failed" && last.finixTransferId === null) {
+      if (sub.planId !== plan.id) throw new BillingError("FINIX_SUB_EXISTS");
+      residue = { sub, charge: last };
     }
   }
   if (!plan.active) throw new BillingError("PLAN_NOT_FOUND");
@@ -250,35 +261,53 @@ export async function createFinixSubscription(
       },
     })
     .run();
-  const subId = ulid();
-  db.insert(subscriptions)
-    .values({
-      id: subId,
-      userId: user.id,
-      provider: "finix",
-      finixIdentityId: identityId,
-      planId: plan.id,
-      stripeSubscriptionId: null,
-      stripePriceId: null,
-      status: "incomplete",
-      currentPeriodEnd: now + periodMs(plan.interval),
-      createdAt: now,
-      updatedAt: now,
-    })
-    .run();
-  const charge = insertCharge(db, {
-    subscriptionId: subId,
-    periodStart: now,
-    periodEnd: now + periodMs(plan.interval),
-    amountCents: plan.priceCents,
-    currency: plan.currency.toUpperCase(),
-  });
-  const sub = db.select().from(subscriptions).where(eq(subscriptions.id, subId)).get();
-  if (!sub) throw new Error("inserted subscription not found");
+  let sub: Subscription;
+  let charge: Charge;
+  if (residue) {
+    // Resurrect the dead sub and re-attempt the SAME charge row — same
+    // idempotency key, so a transfer that actually committed the first time
+    // returns the existing record instead of charging twice.
+    sub = residue.sub;
+    charge = residue.charge;
+    db.update(subscriptions)
+      .set({
+        status: "incomplete",
+        finixIdentityId: identityId,
+        currentPeriodEnd: charge.periodEnd,
+        updatedAt: now,
+      })
+      .where(eq(subscriptions.id, sub.id))
+      .run();
+  } else {
+    const subId = ulid();
+    db.insert(subscriptions)
+      .values({
+        id: subId,
+        userId: user.id,
+        provider: "finix",
+        finixIdentityId: identityId,
+        planId: plan.id,
+        stripeSubscriptionId: null,
+        stripePriceId: null,
+        status: "incomplete",
+        currentPeriodEnd: now + periodMs(plan.interval),
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    sub = db.select().from(subscriptions).where(eq(subscriptions.id, subId)).get() as Subscription;
+    charge = insertCharge(db, {
+      subscriptionId: sub.id,
+      periodStart: now,
+      periodEnd: now + periodMs(plan.interval),
+      amountCents: plan.priceCents,
+      currency: plan.currency.toUpperCase(),
+    });
+  }
   await chargeForPeriod(db, finix, sub, charge);
   // Re-select: the fast path may have settled the sub (incomplete → active/…).
-  const settled = db.select().from(subscriptions).where(eq(subscriptions.id, subId)).get();
-  if (!settled) throw new Error("inserted subscription not found");
+  const settled = db.select().from(subscriptions).where(eq(subscriptions.id, sub.id)).get();
+  if (!settled) throw new Error("subscription not found");
   return { subscription: settled, charge };
 }
 
@@ -315,22 +344,27 @@ export async function chargeForPeriod(
   } catch (e) {
     // A thrown transfer leaves no webhook to settle the charge — mark it
     // failed so the sub isn't wedged pending forever, then propagate.
+    // The transfer MAY still exist provider-side; processFinixEvent will
+    // settle a `failed` charge whose finixTransferId is null if it turns up.
     applyChargeOutcome(db, charge, "failed");
     charge.status = "failed";
     throw e;
   }
   charge.finixTransferId = t.id ?? null;
+  // Back to pending: a live transfer now exists provider-side, so the webhook
+  // must be able to settle this charge (residue rows arrive here as `failed`).
   db.update(charges)
-    .set({ finixTransferId: charge.finixTransferId, updatedAt: Date.now() })
+    .set({ status: "pending", finixTransferId: charge.finixTransferId, updatedAt: Date.now() })
     .where(eq(charges.id, charge.id))
     .run();
   const outcome = transferOutcome(t.state);
   if (outcome !== "pending") {
     applyChargeOutcome(db, charge, outcome);
     charge.status = outcome;
+  } else {
+    charge.status = "pending";
   }
 }
-
 export type FinixEvent = { id?: string; type?: string; entity?: string; data?: FinixTransfer };
 
 /** Stable across Finix delivery retries: event id, else transfer id+state+updated_at. */
@@ -350,19 +384,39 @@ export function processFinixEvent(db: DB, event: FinixEvent): "APPLIED" | "IGNOR
   const charge =
     (chargeId ? db.select().from(charges).where(eq(charges.id, chargeId)).get() : undefined) ??
     (t.tags?.subscriptionId ? latestPendingCharge(db, t.tags.subscriptionId) : undefined);
-  if (charge?.status !== "pending") {
+  // Settleable = pending, OR failed with no transfer id — the signature of a
+  // charge whose postTransfer threw before we could stamp it. That transfer
+  // may still exist provider-side; this event is its only reconciliation.
+  const settleable =
+    charge?.status === "pending" ||
+    (charge?.status === "failed" && charge.finixTransferId === null);
+  if (!settleable) {
     recordEvent(db, key, event.type ?? "transfer", "finix");
     return "IGNORED";
   }
   const outcome = transferOutcome(t.state);
-  if (outcome === "pending") {
-    recordEvent(db, key, event.type ?? "transfer", "finix");
-    return "IGNORED";
-  }
   db.update(charges)
     .set({ finixTransferId: t.id, updatedAt: Date.now() })
     .where(eq(charges.id, charge.id))
     .run();
+  if (outcome === "pending") {
+    // Re-arm: the transfer exists and is still in flight — restore pending
+    // so a later terminal event can settle it.
+    if (charge.status === "failed") {
+      db.update(charges)
+        .set({ status: "pending", updatedAt: Date.now() })
+        .where(eq(charges.id, charge.id))
+        .run();
+    }
+    recordEvent(db, key, event.type ?? "transfer", "finix");
+    return "IGNORED";
+  }
+  if (charge.status === "failed" && outcome === "failed") {
+    // Already counted this failure when the charge was marked — applying
+    // again would double-count toward MAX_FAILURES.
+    recordEvent(db, key, event.type ?? "transfer", "finix");
+    return "APPLIED";
+  }
   applyChargeOutcome(db, charge, outcome);
   recordEvent(db, key, event.type ?? "transfer", "finix");
   return "APPLIED";

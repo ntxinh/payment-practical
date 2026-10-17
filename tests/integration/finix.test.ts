@@ -255,7 +255,7 @@ describe("final-review fixes", () => {
   let db: DB;
   afterEach(() => db?.$client.close());
 
-  it("thrown transfer → charge failed, sub incomplete_expired, re-subscribe allowed", async () => {
+  it("thrown transfer → charge failed, sub incomplete_expired, retry resurrects same rows", async () => {
     db = makeTestDb("finix-throw");
     const user = seedUser(db);
     const plan = seedPlan(db);
@@ -272,7 +272,8 @@ describe("final-review fixes", () => {
     expect(sub.status).toBe("incomplete_expired");
     expect(charge.status).toBe("failed");
 
-    // Dead sub + failed charge must not block a retry.
+    // Retry resurrects the SAME sub + charge — same idempotency key, no
+    // double-bill if the first throw actually committed provider-side.
     const ok = finixStub((path) => {
       if (path === "/identities") return { id: "ID_1" };
       if (path.startsWith("/payment_instruments/")) return { id: "PI_2" };
@@ -280,7 +281,166 @@ describe("final-review fixes", () => {
     });
     const again = await createFinixSubscription(db, ok, user, plan, "PI_2");
     expect(again.subscription.status).toBe("active");
-    expect(db.select().from(subscriptions).all()).toHaveLength(2);
+    expect(again.subscription.id).toBe(sub.id);
+    expect(again.charge.id).toBe(charge.id);
+    expect(db.select().from(subscriptions).all()).toHaveLength(1);
+    expect(db.select().from(charges).all()).toHaveLength(1);
+  });
+
+  it("webhook SUCCEEDED reconciles a failed charge with no transfer id (throw-after-commit)", async () => {
+    db = makeTestDb("finix-reconcile");
+    seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s1",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "incomplete_expired",
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    db.insert(charges)
+      .values({
+        id: "c1",
+        subscriptionId: "s1",
+        status: "failed",
+        finixTransferId: null,
+        periodStart: NOW,
+        periodEnd: NOW + periodMs("month"),
+        amountCents: 999,
+        currency: "USD",
+        attemptNo: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const r = processFinixEvent(db, {
+      entity: "transfer",
+      data: { id: "TR_late", state: "SUCCEEDED", tags: { chargeId: "c1" } },
+    });
+    expect(r).toBe("APPLIED");
+    expect(getCharge(db, "c1")).toMatchObject({ status: "paid", finixTransferId: "TR_late" });
+    expect(getSub(db, "s1").status).toBe("active");
+  });
+
+  it("webhook PENDING on a failed-null-transfer charge re-arms it to pending", async () => {
+    db = makeTestDb("finix-rearm");
+    seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s1",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "past_due",
+        consecutiveFailures: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    db.insert(charges)
+      .values({
+        id: "c1",
+        subscriptionId: "s1",
+        status: "failed",
+        finixTransferId: null,
+        periodStart: NOW,
+        periodEnd: NOW + periodMs("month"),
+        amountCents: 999,
+        currency: "USD",
+        attemptNo: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const r = processFinixEvent(db, {
+      entity: "transfer",
+      data: { id: "TR_late", state: "PENDING", tags: { chargeId: "c1" } },
+    });
+    expect(r).toBe("IGNORED");
+    expect(getCharge(db, "c1")).toMatchObject({ status: "pending", finixTransferId: "TR_late" });
+  });
+
+  it("webhook FAILED on an already-failed charge does not double-count failures", async () => {
+    db = makeTestDb("finix-nodouble");
+    seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s1",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "past_due",
+        consecutiveFailures: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    db.insert(charges)
+      .values({
+        id: "c1",
+        subscriptionId: "s1",
+        status: "failed",
+        finixTransferId: null,
+        periodStart: NOW,
+        periodEnd: NOW + periodMs("month"),
+        amountCents: 999,
+        currency: "USD",
+        attemptNo: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const r = processFinixEvent(db, {
+      entity: "transfer",
+      data: { id: "TR_late", state: "FAILED", tags: { chargeId: "c1" } },
+    });
+    expect(r).toBe("APPLIED");
+    expect(getSub(db, "s1").consecutiveFailures).toBe(1); // not 2
+    expect(getCharge(db, "c1").finixTransferId).toBe("TR_late");
+  });
+
+  it("failed charge WITH a transfer id stays ignored (settled normally earlier)", async () => {
+    db = makeTestDb("finix-settled");
+    seedUser(db);
+    const plan = seedPlan(db);
+    db.insert(subscriptions)
+      .values({
+        id: "s1",
+        userId: "u1",
+        provider: "finix",
+        planId: plan.id,
+        status: "past_due",
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    db.insert(charges)
+      .values({
+        id: "c1",
+        subscriptionId: "s1",
+        status: "failed",
+        finixTransferId: "TR_old",
+        periodStart: NOW,
+        periodEnd: NOW + periodMs("month"),
+        amountCents: 999,
+        currency: "USD",
+        attemptNo: 1,
+        createdAt: NOW,
+        updatedAt: NOW,
+      })
+      .run();
+    const r = processFinixEvent(db, {
+      entity: "transfer",
+      data: { id: "TR_new", state: "SUCCEEDED", tags: { chargeId: "c1" } },
+    });
+    expect(r).toBe("IGNORED");
+    expect(getCharge(db, "c1").status).toBe("failed");
   });
 
   it("NO_INSTRUMENT also fails the charge (no wedged pending)", async () => {
