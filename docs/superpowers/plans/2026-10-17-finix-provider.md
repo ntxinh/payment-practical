@@ -701,7 +701,7 @@ export async function finixCancel(): Promise<void> {
 
 `/subscribe/finix/page.tsx` — server component; `searchParams.planId` → plan lookup (redirect `/pricing?error=PLAN_NOT_FOUND`); renders `<FinixForm applicationId={process.env.FINIX_APPLICATION_ID} planId={plan.id} />`.
 
-`finix-form.tsx` — `"use client"`; `next/script` loads `https://js.finix.com/v1/finix.js`; mounts iframe card fields per Finix.js docs (exact init verified at implementation); on tokenize success writes the returned `PI_…` id into hidden input `paymentInstrumentId` and submits `<form action={finixSubscribe}>`; on failure renders `.error` line. Minimal markup; reuse globals.css.
+`finix-form.tsx` — `"use client"`; `next/script` loads `https://js.finix.com/v/1/finix.js`; mounts iframe card fields per Finix.js docs (exact init verified at implementation); on tokenize success writes the returned `PI_…` id into hidden input `paymentInstrumentId` and submits `<form action={finixSubscribe}>`; on failure renders `.error` line. Minimal markup; reuse globals.css.
 
 `/pricing` — under each plan card add, when `finixConfigured()`: `<Link href={\`/subscribe/finix?plan=${p.id}\`}>Pay with Finix</Link>`; when not configured, omit silently (plan card stays Stripe-only).
 

@@ -14,7 +14,11 @@ form POST and a redirect. Revisit if gated content lands.
   `processBillingEvent` flows: forged `checkout.session.completed` →
   `active` row, replayed event id → no-op via `webhook_events`,
   `customer.subscription.deleted` → `canceled`, portal without
-  `stripe_customer_id` → `NO_STRIPE_CUSTOMER`.
+  `stripe_customer_id` → `NO_STRIPE_CUSTOMER`. Finix: subscribe flow
+  (`fetchFn`-stubbed client) → instrument row + `incomplete` sub → settle,
+  transfer events → charge/sub outcomes, tick renewals/retries/cancels,
+  `Finix-Signature` verify + 300s freshness gate, and the finix webhook
+  route end-to-end (forged `timestamp=…,sig=…` header).
 
 ## `tests/.tmp` isolation
 
@@ -42,6 +46,17 @@ is absent.
 
 Checkout/portal session *creation* is covered by the real dev flow
 (`stripe listen` + test card), not unit tests.
+
+## Finix boundary
+
+Mirrors the Stripe seams. `setFinixForTests(stub)` injects a fake `Finix`
+client whose `fetchFn` is a plain function dispatching on (path, method,
+body) — no HTTP mocking. `handleFinixWebhook`/`processFinixEvent` take a
+payload string/event object; tests forge `Finix-Signature` via
+`createHmac("sha256", SECRET)` over `${ts}:${payload}` with a test
+`fwhsec`, so verification runs for real. `tests/integration/
+finix-webhook.test.ts` hits the route directly. `finix-form.tsx` is a thin
+browser passthrough to Finix.js — intentionally untested.
 
 ## Run
 

@@ -29,13 +29,18 @@ via Drizzle (Postgres-portable). Dev-only email auth — NOT production auth.
 - Stripe truth: local `subscriptions` rows are a cache — webhooks
   (`checkout.session.completed`, `customer.subscription.*`) are the only
   writers. Never set subscription status in app code.
+- Finix asymmetry: card iframe → `payment_instruments` (one card per user,
+  `user_id` unique — re-adding replaces); `charges` is the payment ledger
+  (charge id = transfer idempotency key). Only `runBillingTick` +
+  `/api/v1/webhooks/finix` advance finix status; `finixCancel` just flags
+  `cancel_at_period_end` for the tick to apply.
 - Idempotent webhook processing via the `webhook_events` table; a row is
   recorded at terminal outcomes (applied or ignored), never before work.
 - `current_period_end` is on `SubscriptionItem`, not `Subscription`.
 
 ## Commands
 
-- Setup: `make setup`, `make db-reset`, `make stripe-seed`.
+- Setup: `make setup`, `make db-reset`, `make stripe-seed`, `make finix-webhook-seed`.
 - Webhooks: `stripe listen --forward-to localhost:3000/api/v1/webhooks/stripe`
   → copy `whsec_` into `.env`.
 - Gates: `make check` (lint+typecheck+tests), `make verify` (+ build).

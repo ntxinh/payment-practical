@@ -92,7 +92,7 @@ actions `finixSubscribe(formData)`/`finixCancel()` live in
    `subscribe`), "Pay with Finix" → GET `/subscribe/finix?plan=<slug>`.
 2. `/subscribe/finix` page: server-rendered shell passes `applicationId` +
    `planId` to a client component (`finix-form.tsx`) that loads
-   `https://js.finix.com/v1/finix.js` via `next/script`, mounts iframe card
+   `https://js.finix.com/v/1/finix.js` via `next/script`, mounts iframe card
    fields, calls its tokenize API, then submits the returned
    `payment_instrument` id through a hidden input to `finixSubscribe`.
 3. `finixSubscribe(formData)` — auth-required:

@@ -1,7 +1,9 @@
+import Link from "next/link";
 import { redirect } from "next/navigation";
 import { subscribe } from "@/features/billing/actions";
 import { getCurrentUser } from "@/server/auth/session";
 import { getDb } from "@/server/db/client";
+import { finixConfigured } from "@/server/modules/billing/finix";
 import { getActivePlans } from "@/server/modules/billing/plans";
 
 export default async function PricingPage({
@@ -13,6 +15,7 @@ export default async function PricingPage({
   if (!user) redirect("/login");
   const { error } = await searchParams;
   const plans = getActivePlans(getDb());
+  const finixOn = finixConfigured();
   return (
     <>
       <h1>Plans</h1>
@@ -31,6 +34,11 @@ export default async function PricingPage({
               </form>
             ) : (
               <p>Unavailable — run make stripe-seed</p>
+            )}
+            {finixOn && (
+              <Link className="btn" href={`/subscribe/finix?plan=${p.id}`}>
+                Pay with Finix
+              </Link>
             )}
           </div>
         ))}
