@@ -1,9 +1,21 @@
 import "server-only";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { eq } from "drizzle-orm";
+import { ulid } from "ulidx";
 import type { DB } from "@/server/db/client";
-import { type User, users } from "@/server/db/schema";
+import {
+  type Charge,
+  charges,
+  type Plan,
+  paymentInstruments,
+  type Subscription,
+  subscriptions,
+  type User,
+  users,
+} from "@/server/db/schema";
 import { BillingError } from "./errors";
+import { applyChargeOutcome, insertCharge, latestPendingCharge, periodMs } from "./subscriptions";
+import { recordEvent, seenEvent } from "./webhookEvents";
 
 const DEFAULT_BASE = "https://finix.sandbox-payments-api.com";
 const FINIX_VERSION = "2022-02-01";
@@ -165,4 +177,164 @@ export async function postTransfer(
     ...body,
     currency: body.currency.toUpperCase(),
   });
+}
+
+/**
+ * Tokenized instrument → attached to the user's identity → subscription +
+ * first charge created → transfer issued. SUCCEEDED responses settle
+ * immediately (fast path); anything else waits for the webhook.
+ */
+export async function createFinixSubscription(
+  db: DB,
+  finix: Finix,
+  user: User,
+  plan: Plan,
+  paymentInstrumentId: string,
+): Promise<{ subscription: Subscription; charge: Charge }> {
+  const identityId = await ensureIdentity(db, finix, user);
+  await attachInstrument(finix, identityId, paymentInstrumentId);
+  const now = Date.now();
+  db.insert(paymentInstruments)
+    .values({
+      id: ulid(),
+      userId: user.id,
+      finixInstrumentId: paymentInstrumentId,
+      finixIdentityId: identityId,
+      createdAt: now,
+      updatedAt: now,
+    })
+    .onConflictDoUpdate({
+      target: paymentInstruments.userId,
+      set: {
+        finixInstrumentId: paymentInstrumentId,
+        finixIdentityId: identityId,
+        updatedAt: now,
+      },
+    })
+    .run();
+  const subId = ulid();
+  db.insert(subscriptions)
+    .values({
+      id: subId,
+      userId: user.id,
+      provider: "finix",
+      finixIdentityId: identityId,
+      planId: plan.id,
+      stripeSubscriptionId: null,
+      stripePriceId: null,
+      status: "incomplete",
+      currentPeriodEnd: now + periodMs(plan.interval),
+      createdAt: now,
+      updatedAt: now,
+    })
+    .run();
+  const charge = insertCharge(db, {
+    subscriptionId: subId,
+    periodStart: now,
+    periodEnd: now + periodMs(plan.interval),
+    amountCents: plan.priceCents,
+    currency: plan.currency.toUpperCase(),
+  });
+  const sub = db.select().from(subscriptions).where(eq(subscriptions.id, subId)).get();
+  if (!sub) throw new Error("inserted subscription not found");
+  await chargeForPeriod(db, finix, sub, charge);
+  return { subscription: sub, charge };
+}
+
+/** Charges one period. Terminal transfer states apply immediately (and mark
+ *  the passed charge object so callers can redirect on charge.status);
+ *  pending relies on the webhook. Errors propagate (caller 500s → retry). */
+export async function chargeForPeriod(
+  db: DB,
+  finix: Finix,
+  sub: Subscription,
+  charge: Charge,
+): Promise<void> {
+  const instrument = db
+    .select()
+    .from(paymentInstruments)
+    .where(eq(paymentInstruments.userId, sub.userId))
+    .get();
+  if (!instrument) throw new BillingError("FINIX_NO_INSTRUMENT");
+  const t = await postTransfer(finix, {
+    amount: charge.amountCents,
+    currency: charge.currency,
+    source: instrument.finixInstrumentId,
+    merchant_id: finix.merchantId,
+    idempotency_id: charge.id,
+    tags: { chargeId: charge.id, subscriptionId: sub.id },
+  });
+  charge.finixTransferId = t.id ?? null;
+  db.update(charges)
+    .set({ finixTransferId: charge.finixTransferId, updatedAt: Date.now() })
+    .where(eq(charges.id, charge.id))
+    .run();
+  const outcome = transferOutcome(t.state);
+  if (outcome !== "pending") {
+    applyChargeOutcome(db, charge, outcome);
+    charge.status = outcome;
+  }
+}
+
+export type FinixEvent = { id?: string; type?: string; entity?: string; data?: FinixTransfer };
+
+/** Stable across Finix delivery retries: event id, else transfer id+state+updated_at. */
+function finixEventKey(event: FinixEvent, t: FinixTransfer): string {
+  return event.id ?? `transfer:${t.id}:${t.state}:${t.updated_at ?? ""}`;
+}
+
+/** Transfer events only, deduped on (key, 'finix'); terminal outcomes applied.
+ *  Non-pending charges are never re-applied (a settled charge stays settled). */
+export function processFinixEvent(db: DB, event: FinixEvent): "APPLIED" | "IGNORED" {
+  const t = event.data ?? {};
+  if (event.entity !== "transfer" || !t.id) return "IGNORED";
+  const key = finixEventKey(event, t);
+  if (seenEvent(db, key, "finix")) return "IGNORED";
+
+  const chargeId = t.tags?.chargeId;
+  const charge =
+    (chargeId ? db.select().from(charges).where(eq(charges.id, chargeId)).get() : undefined) ??
+    (t.tags?.subscriptionId ? latestPendingCharge(db, t.tags.subscriptionId) : undefined);
+  if (charge?.status !== "pending") {
+    recordEvent(db, key, event.type ?? "transfer", "finix");
+    return "IGNORED";
+  }
+  const outcome = transferOutcome(t.state);
+  if (outcome === "pending") {
+    recordEvent(db, key, event.type ?? "transfer", "finix");
+    return "IGNORED";
+  }
+  db.update(charges)
+    .set({ finixTransferId: t.id, updatedAt: Date.now() })
+    .where(eq(charges.id, charge.id))
+    .run();
+  applyChargeOutcome(db, charge, outcome);
+  recordEvent(db, key, event.type ?? "transfer", "finix");
+  return "APPLIED";
+}
+
+const MAX_SIG_SKEW_S = 300;
+
+/** 404 unconfigured/missing header; 400 bad sig or stale timestamp (>300s skew); 200 processed. */
+export function handleFinixWebhook(
+  db: DB,
+  payload: string,
+  signatureHeader: string | null,
+): { status: number } {
+  const secret = process.env.FINIX_WEBHOOK_SECRET;
+  if (!secret || !finixConfigured() || !signatureHeader) return { status: 404 };
+  if (!verifyFinixSignature(payload, signatureHeader, secret)) return { status: 400 };
+  const ts = Number(
+    signatureHeader
+      .split(",")
+      .map((kv) => kv.trim())
+      .find((kv) => kv.startsWith("timestamp="))
+      ?.slice("timestamp=".length),
+  );
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > MAX_SIG_SKEW_S) {
+    return { status: 400 };
+  }
+  const event = JSON.parse(payload) as FinixEvent;
+  processFinixEvent(db, event);
+  return { status: 200 };
 }
