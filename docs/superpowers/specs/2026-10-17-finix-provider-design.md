@@ -32,11 +32,12 @@ toggle on /pricing**, **tokenization iframe** (not hosted forms).
 `users`: + `finix_identity_id` text (Finix `ID_…` Identity, reused across
 subscriptions).
 
-`plans`: + `finix_product_id` text nullable — Finix requires a Product with
-`subscription_amount` to sell recurring-style charges.
+`plans`: unchanged. Finix plain `/transfers` need no Product — Products
+and `SUS_` subscriptions belong to Finix's native Subscriptions API,
+which our self-billing engine does not use. No finix-seed, no
+`finix_product_id`, no `finix_subscription_id`.
 
 `subscriptions`: + `provider` text not null default `'stripe'`;
-+ `finix_subscription_id` text unique nullable (`SUS_…`);
 + `finix_identity_id` text nullable; + `plan_id` text FK→plans nullable
 (required for finix rows — tick needs price+interval; stripe rows may stay
 null, they look up by `stripe_price_id`);
@@ -104,10 +105,10 @@ actions `finixSubscribe(formData)`/`finixCancel()` live in
    settle immediately (same `applyChargeOutcome` the webhook uses — fast
    path); else status stays `incomplete` until the webhook. Redirect
    `/account/billing?pending=1` or `?success=1`.
-4. Webhook `transfer` event with `tags.chargeId` (or `entity_id` on the
-   transfer): charge → paid/failed; on paid → subscription `active`,
-   `finix_subscription_id` recorded, `consecutive_failures=0`; on failed
-   first charge → `incomplete_expired`.
+4. Webhook `transfer` event with `tags.chargeId` (fallback: latest pending
+   charge for `tags.subscriptionId`): charge → paid/failed; on paid →
+   subscription `active`, `consecutive_failures=0`; on failed first charge
+   → `incomplete_expired`.
 
 ### Renewal tick — `runBillingTick(db)` in `modules/billing/tick.ts`
 
@@ -122,10 +123,12 @@ documented as such.
 - `status='past_due'` AND `consecutive_failures < MAX_FAILURES (=3)`:
   insert another charge (`attempt_no+1`) + charge.
 - `consecutive_failures >= 3` → `status='canceled'`.
-- Charge outcome application (shared with webhook):
+- Charge outcome application (shared with webhook — decided by
+  `subscription.status`, NOT `attempt_no` which resets per renewal):
   paid → `current_period_end = charge.period_end`, status `active`,
-  failures reset; failed → status `past_due`, `consecutive_failures++`
-  (renewal only; first charge → `incomplete_expired`).
+  failures reset; failed → `consecutive_failures++` and
+  status `incomplete_expired` when sub was `incomplete`, else `past_due`.
+- Tick skips any finix sub with a pending charge (in-flight transfer).
 
 Period Δ: `interval 'month' → 30d`, `'year' → 365d` (ms). Documented
 approximation — dev billing engine, not calendar billing.
@@ -152,18 +155,12 @@ the Finix API, prints the returned secret and instructs adding
 at a tunnel or rely on the charge-response fast path + tick for demo flow.
 Documented, not automated.
 
-### Seeding
-
-`scripts/finix-seed.ts` — for each PLAN_DEF: find/create a Finix product
-(`subscription_amount = priceCents`, currency, type SUBSCRIPTION), store
-`finix_product_id` on the plan. Idempotent by `tags.slug` lookup like
-stripe-seed.
 
 ## UI changes
 
 - `/pricing`: plan card shows both provider buttons; Finix button links to
-  `/subscribe/finix?plan=<slug>` (disabled note if `finix_product_id` null
-  — "run make finix-seed").
+  `/subscribe/finix?plan=<slug>` (hidden with a "Finix not configured" note
+  when FINIX creds are absent).
 - `/subscribe/finix`: card iframe + submit. Only client component in the
   app — Finix.js init params (`application`/`AP_…` id, `environment:
   'sandbox'` or equivalent) verified against Finix docs at implementation;
@@ -175,7 +172,7 @@ stripe-seed.
 ## Types & errors
 
 New `BillingErrorCode`s: `FINIX_NOT_CONFIGURED`, `FINIX_INSTRUMENT_INVALID`,
-`FINIX_NO_INSTRUMENT`, `FINIX_PRODUCT_NOT_SEEDED`. `ChargeStatus` union as
+`FINIX_NO_INSTRUMENT`. `ChargeStatus` union as
 above. `SubscriptionStatus` union unchanged (`paused`/`trialing` unused by
 finix but tolerated); `isActive` unchanged — incomplete_expired finix subs
 grant no access.
@@ -209,7 +206,7 @@ Demo note: sandbox Finix accounts auto-approve most transfers.
 
 ## Docs to update
 
-README (finix quickstart: `make finix-seed`, webhook reg, tick endpoint),
+README (finix quickstart: `make finix-webhook-seed`, tick endpoint, card flow),
 AGENTS.md (provider asymmetry + tick rule: only `runBillingTick`/webhooks
 advance finix status), DESIGN.md, docs/architecture|database|operations|
 testing.
