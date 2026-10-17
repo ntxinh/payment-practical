@@ -16,8 +16,9 @@ app → features → server/modules → server/db
 
 Every `src/server/**` file starts with `import "server-only";`, so nothing
 server-side can be bundled into a client component. Modules expose service
-functions; schema internals are never imported outside `server/db` except by
-sibling server modules.
+functions and own the business rules; `server/db` (client + schema) may also
+be used directly by feature actions for simple persistence (e.g. user
+find-or-create) and by app pages/route handlers for reads.
 
 ## File map
 

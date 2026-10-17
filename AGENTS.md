@@ -18,7 +18,8 @@ via Drizzle (Postgres-portable). Dev-only email auth — NOT production auth.
 - Dependency direction: `app → features → server/modules → server/db`.
 - Every `src/server/**` file starts with `import "server-only";`.
 - Business rules live in `src/server/modules/billing`; route handlers and
-  server actions only parse → authorize → delegate → serialize.
+  server actions delegate to it, but feature actions may use `server/db`
+  directly for simple persistence.
 
 ## Conventions
 

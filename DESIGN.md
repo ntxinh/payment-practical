@@ -13,8 +13,9 @@ Subscription slice only — no gated content, no learning features.
 
 Modular monolith; dependency direction `app → features → server/modules →
 server/db`. Every `src/server/**` file starts with `import "server-only";`.
-Route handlers and server actions only parse → authorize → delegate →
-serialize; business rules live in `src/server/modules/billing/`.
+Route handlers and server actions delegate to `src/server/modules/billing/`
+for business rules; feature actions may use `server/db` directly for simple
+persistence (e.g. user find-or-create in `features/auth/actions.ts`).
 
 ```
 src/
