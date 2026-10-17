@@ -2,8 +2,8 @@ import { eq } from "drizzle-orm";
 import type Stripe from "stripe";
 import { afterEach, describe, expect, it } from "vitest";
 import type { DB } from "@/server/db/client";
-import { processBillingEvent } from "@/server/modules/billing/stripe";
 import { subscriptions, users } from "@/server/db/schema";
+import { processBillingEvent } from "@/server/modules/billing/stripe";
 import { makeTestDb } from "../helpers/db";
 
 const user = { id: "u1", email: "u@x.y", stripeCustomerId: "cus_1", createdAt: Date.now() };
@@ -38,9 +38,17 @@ describe("processBillingEvent", () => {
   it("checkout.session.completed → active subscription row", async () => {
     seed();
     const session = { mode: "subscription", subscription: "sub_1" };
-    const out = await processBillingEvent(db, stripeClient, event("checkout.session.completed", session));
+    const out = await processBillingEvent(
+      db,
+      stripeClient,
+      event("checkout.session.completed", session),
+    );
     expect(out).toBe("APPLIED");
-    const row = db.select().from(subscriptions).where(eq(subscriptions.stripeSubscriptionId, "sub_1")).get();
+    const row = db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, "sub_1"))
+      .get();
     expect(row?.status).toBe("active");
     expect(row?.userId).toBe(user.id);
     expect(row?.currentPeriodEnd).toBe(1_800_000_000_000); // s → ms
@@ -57,13 +65,21 @@ describe("processBillingEvent", () => {
 
   it("customer.subscription.deleted → canceled", async () => {
     seed();
-    await processBillingEvent(db, stripeClient, event("customer.subscription.updated", stripeSub()));
+    await processBillingEvent(
+      db,
+      stripeClient,
+      event("customer.subscription.updated", stripeSub()),
+    );
     await processBillingEvent(
       db,
       stripeClient,
       event("customer.subscription.deleted", stripeSub({ status: "canceled" })),
     );
-    const row = db.select().from(subscriptions).where(eq(subscriptions.stripeSubscriptionId, "sub_1")).get();
+    const row = db
+      .select()
+      .from(subscriptions)
+      .where(eq(subscriptions.stripeSubscriptionId, "sub_1"))
+      .get();
     expect(row?.status).toBe("canceled");
   });
 

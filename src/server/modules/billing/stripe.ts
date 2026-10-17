@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import Stripe from "stripe";
 import { ulid } from "ulidx";
 import type { DB } from "@/server/db/client";
-import { subscriptions, users, webhookEvents, type Plan, type User } from "@/server/db/schema";
+import { type Plan, subscriptions, type User, users, webhookEvents } from "@/server/db/schema";
 import { appUrl } from "@/server/env";
 import { BillingError } from "./errors";
 import { mapSubscriptionStatus, type SubscriptionStatus } from "./subscriptions";
@@ -114,7 +114,8 @@ export async function processBillingEvent(
   let sub: Stripe.Subscription | null = null;
   if (event.type === "checkout.session.completed") {
     const session = event.data.object as Stripe.Checkout.Session;
-    const subId = typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
+    const subId =
+      typeof session.subscription === "string" ? session.subscription : session.subscription?.id;
     if (session.mode !== "subscription" || !subId) {
       record();
       return "IGNORED";

@@ -1,15 +1,27 @@
 import "server-only";
 import { desc, eq } from "drizzle-orm";
 import type { DB } from "@/server/db/client";
-import { subscriptions, type Subscription } from "@/server/db/schema";
+import { type Subscription, subscriptions } from "@/server/db/schema";
 
 export type SubscriptionStatus =
-  | "active" | "trialing" | "past_due" | "canceled" | "paused"
-  | "incomplete" | "incomplete_expired" | "unpaid";
+  | "active"
+  | "trialing"
+  | "past_due"
+  | "canceled"
+  | "paused"
+  | "incomplete"
+  | "incomplete_expired"
+  | "unpaid";
 
 const KNOWN: Record<SubscriptionStatus, true> = {
-  active: true, trialing: true, past_due: true, canceled: true, paused: true,
-  incomplete: true, incomplete_expired: true, unpaid: true,
+  active: true,
+  trialing: true,
+  past_due: true,
+  canceled: true,
+  paused: true,
+  incomplete: true,
+  incomplete_expired: true,
+  unpaid: true,
 };
 
 /** Unknown/future Stripe statuses map to unpaid — never grant access on ambiguity. */
